@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Service Area Drawing Widget</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/leaflet.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
+<script src="https://js.jotform.com/JotFormCustomWidget.min.js"></script>
+<style>
+  :root {
+    --ink: #1d2b2a;
+    --muted: #5d6b6a;
+    --line: #cfd8d6;
+    --panel: #f5f8f7;
+    --accent: #0e7c66;
+    --accent-dark: #0a5c4b;
+    --warn: #b3261e;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; font-family: "Segoe UI", system-ui, -apple-system, Arial, sans-serif; color: var(--ink); background: transparent; font-size: 14px; }
+  .wrap { padding: 2px; }
+  .toolbar { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+  .toolbar input[type=text] { flex: 1 1 200px; min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 14px; }
+  .toolbar input[type=text]:focus, .name-input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button.btn { padding: 9px 14px; border: 1px solid var(--accent); background: var(--accent); color: #fff; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button.btn:hover { background: var(--accent-dark); }
+  button.btn.secondary { background: #fff; color: var(--accent-dark); }
+  button.btn.secondary:hover { background: var(--panel); }
+  button.btn:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+  #map { height: 400px; width: 100%; border: 1px solid var(--line); border-radius: 6px; }
+  .hint { color: var(--muted); margin: 8px 0; line-height: 1.4; }
+  .status { margin: 6px 0; min-height: 18px; color: var(--warn); }
+  .summary { font-weight: 600; margin: 8px 0 6px; }
+  .list { display: flex; flex-direction: column; gap: 6px; }
+  .item { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; align-items: start; }
+  .item .name-input { width: 100%; padding: 5px 7px; border: 1px solid var(--line); border-radius: 4px; font-size: 13px; font-weight: 600; background: #fff; }
+  .item .meta { grid-column: 1 / 2; color: var(--muted); font-size: 13px; line-height: 1.35; }
+  .item .actions { grid-column: 2 / 3; grid-row: 1 / 3; display: flex; flex-direction: column; gap: 4px; }
+  .item .actions button { padding: 4px 8px; border: 1px solid var(--line); background: #fff; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .item .actions button:hover { background: var(--panel); }
+  .item .actions button.danger { color: var(--warn); }
+  .empty { color: var(--muted); padding: 8px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="toolbar">
+    <input type="text" id="search" placeholder="Search for a suburb, city or address" aria-label="Search for a place">
+    <button class="btn" id="searchBtn" type="button">Find place</button>
+    <button class="btn secondary" id="locBtn" type="button">Use my location</button>
+  </div>
+  <div id="map" role="application" aria-label="Map for drawing service areas"></div>
+  <p class="hint">Use the shape tools at the top left of the map (polygon or rectangle) to outline each area you service. You can add as many shapes as you need, and zoom or drag the map anywhere. Use the pencil tool to adjust a shape or the bin to remove one.</p>
+  <div class="status" id="status" role="status" aria-live="polite"></div>
+  <div class="summary" id="summary"></div>
+  <div class="list" id="list"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  var map, fg, mapReady = false, pendingValue = null;
+  var cfg = { lat: -25.0, lng: 134.0, zoom: 4, requireShape: true, height: 700 };
+  var shapeSeq = 0;
+  var geoChain = Promise.resolve();
+  var inJotform = typeof window.JFCustomWidget !== 'undefined';
+
+  /* ---------- helpers ---------- */
+  function setting(name, def) {
+    try {
+      var v = JFCustomWidget.getWidgetSetting(name);
+      return (v === undefined || v === null || v === '') ? def : v;
+    } catch (e) { return def; }
+  }
+  function $(id) { return document.getElementById(id); }
+  function round6(n) { return Math.round(n * 1e6) / 1e6; }
+  function rad(d) { return d * Math.PI / 180; }
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  function setStatus(msg) { $('status').textContent = msg || ''; }
+  function resize() {
+    if (!inJotform) return;
+    var h = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight) + 8;
+    try { JFCustomWidget.requestFrameResize({ height: h }); } catch (e) {}
+  }
+
+  // Spherical polygon area in square metres (Chamberlain-Duquette)
+  function ringArea(pts) {
+    var n = pts.length, R = 6378137, s = 0;
+    if (n < 3) return 0;
+    for (var i = 0; i < n; i++) {
+      var p1 = pts[i], p2 = pts[(i + 1) % n];
+      s += rad(p2.lng - p1.lng) * (2 + Math.sin(rad(p1.lat)) + Math.sin(rad(p2.lat)));
+    }
+    return Math.abs(s * R * R / 2);
+  }
+  // Planar centroid (good enough for locating a label point)
+  function ringCentroid(pts) {
+    var a = 0, cx = 0, cy = 0, n = pts.length;
+    for (var i = 0; i < n; i++) {
+      var p1 = pts[i], p2 = pts[(i + 1) % n];
+      var f = p1.lng * p2.lat - p2.lng * p1.lat;
+      a += f; cx += (p1.lng + p2.lng) * f; cy += (p1.lat + p2.lat) * f;
+    }
+    if (Math.abs(a) < 1e-12) {
+      var b = L.latLngBounds(pts).getCenter();
+      return { lat: b.lat, lng: b.lng };
+    }
+    a *= 0.5;
+    return { lat: cy / (6 * a), lng: cx / (6 * a) };
+  }
+  function getRing(layer) {
+    var ll = layer.getLatLngs();
+    return (ll.length && Array.isArray(ll[0])) ? ll[0] : ll;
+  }
+  function fmtArea(m2) {
+    var km2 = m2 / 1e6;
+    var mi2 = m2 / 2589988.11;
+    var ha = m2 / 1e4;
+    var k = km2 >= 100 ? km2.toFixed(0) : km2 >= 1 ? km2.toFixed(2) : km2.toFixed(3);
+    return k + ' km\u00B2 (' + (mi2 >= 1 ? mi2.toFixed(2) : mi2.toFixed(3)) + ' sq mi, ' + (ha >= 100 ? ha.toFixed(0) : ha.toFixed(1)) + ' ha)';
+  }
+
+  /* ---------- geocoding (OpenStreetMap Nominatim, 1 request/sec) ---------- */
+  function formatAddress(j, lat, lng) {
+    if (!j || j.error || !j.address) {
+      return j && j.display_name ? j.display_name : null;
+    }
+    var a = j.address;
+    var parts = [
+      a.suburb || a.neighbourhood || a.city_district || a.quarter,
+      a.city || a.town || a.village || a.municipality || a.hamlet || a.county,
+      a.state || a.region,
+      a.country
+    ];
+    var seen = {}, out = [];
+    parts.forEach(function (p) { if (p && !seen[p]) { seen[p] = 1; out.push(p); } });
+    return out.length ? out.join(', ') : (j.display_name || null);
+  }
+  function reverseGeocode(lat, lng) {
+    var url = 'https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=14&addressdetails=1&accept-language=en&lat=' +
+      encodeURIComponent(lat) + '&lon=' + encodeURIComponent(lng);
+    var p = geoChain.then(function () {
+      return fetch(url).then(function (r) { return r.json(); }).catch(function () { return null; });
+    });
+    geoChain = p.then(function () { return new Promise(function (r) { setTimeout(r, 1100); }); });
+    return p.then(function (j) { return formatAddress(j, lat, lng); });
+  }
+  function fallbackText(c) { return 'Near ' + c.lat.toFixed(4) + ', ' + c.lng.toFixed(4); }
+
+  /* ---------- shape model ---------- */
+  function initShape(layer, name, location) {
+    layer._sa = { id: ++shapeSeq, name: name || ('Area ' + (fg.getLayers().length)), location: location || '', pending: null };
+    return layer;
+  }
+  function refreshShape(layer, forceGeocode) {
+    var ring = getRing(layer);
+    var c = ringCentroid(ring);
+    var sa = layer._sa;
+    sa.areaM2 = ringArea(ring);
+    var moved = !sa.centroid || Math.abs(sa.centroid.lat - c.lat) > 0.001 || Math.abs(sa.centroid.lng - c.lng) > 0.001;
+    sa.centroid = c;
+    if (forceGeocode || moved || !sa.location) {
+      sa.location = '';
+      var token = {};
+      sa.pending = token;
+      var pr = reverseGeocode(c.lat, c.lng).then(function (txt) {
+        if (sa.pending !== token) return;
+        sa.location = txt || fallbackText(c);
+        sa.pending = null;
+        renderList();
+      });
+      sa.promise = pr;
+    }
+  }
+  function nameShapes() {
+    // keep default names tidy
+    fg.getLayers().forEach(function (l, i) {
+      if (/^Area \d+$/.test(l._sa.name)) l._sa.name = 'Area ' + (i + 1);
+    });
+  }
+
+  /* ---------- UI list ---------- */
+  function renderList() {
+    var layers = fg.getLayers();
+    var list = $('list');
+    var total = 0;
+    layers.forEach(function (l) { total += l._sa.areaM2 || 0; });
+    $('summary').textContent = layers.length
+      ? layers.length + (layers.length === 1 ? ' area' : ' areas') + ' drawn, about ' + fmtArea(total) + ' in total'
+      : '';
+    if (!layers.length) {
+      list.innerHTML = '<div class="empty">No areas drawn yet.</div>';
+      resize();
+      return;
+    }
+    // Rebuild only if structure changed, otherwise update text to preserve input focus
+    var existing = list.querySelectorAll('.item');
+    var sameStructure = existing.length === layers.length && Array.prototype.every.call(existing, function (el, i) {
+      return String(layers[i]._sa.id) === el.getAttribute('data-id');
+    });
+    if (sameStructure) {
+      layers.forEach(function (l, i) {
+        var m = existing[i].querySelector('.meta');
+        m.innerHTML = metaHtml(l._sa);
+      });
+      return;
+    }
+    list.innerHTML = '';
+    layers.forEach(function (l) {
+      var sa = l._sa;
+      var el = document.createElement('div');
+      el.className = 'item';
+      el.setAttribute('data-id', sa.id);
+      el.innerHTML =
+        '<input class="name-input" type="text" maxlength="60" aria-label="Name for this area" value="' + esc(sa.name) + '">' +
+        '<div class="actions"><button type="button" data-act="zoom">Show</button><button type="button" class="danger" data-act="del">Remove</button></div>' +
+        '<div class="meta">' + metaHtml(sa) + '</div>';
+      el.querySelector('.name-input').addEventListener('input', function (e) { sa.name = e.target.value; });
+      el.querySelector('[data-act=zoom]').addEventListener('click', function () { map.fitBounds(l.getBounds(), { padding: [30, 30] }); });
+      el.querySelector('[data-act=del]').addEventListener('click', function () { fg.removeLayer(l); nameShapes(); renderList(); });
+      list.appendChild(el);
+    });
+    resize();
+  }
+  function metaHtml(sa) {
+    return 'Area: ' + fmtArea(sa.areaM2 || 0) + '<br>Location: ' + (sa.location ? esc(sa.location) : 'looking up place name\u2026');
+  }
+
+  /* ---------- payload ---------- */
+  function buildPayload() {
+    var total = 0;
+    var shapes = fg.getLayers().map(function (l, i) {
+      var sa = l._sa;
+      var ring = getRing(l);
+      total += sa.areaM2;
+      return {
+        id: i + 1,
+        name: sa.name || ('Area ' + (i + 1)),
+        areaSqKm: Math.round(sa.areaM2 / 1e6 * 10000) / 10000,
+        areaSqMi: Math.round(sa.areaM2 / 2589988.11 * 10000) / 10000,
+        areaHectares: Math.round(sa.areaM2 / 1e4 * 100) / 100,
+        centroid: [round6(sa.centroid.lat), round6(sa.centroid.lng)],
+        location: sa.location || fallbackText(sa.centroid),
+        // Ordered vertices as [lat, lng]. Ring is open: the last vertex connects back to the first.
+        coordinates: ring.map(function (p) { return [round6(p.lat), round6(p.lng)]; })
+      };
+    });
+    var totalKm = Math.round(total / 1e6 * 10000) / 10000;
+    return {
+      summary: shapes.length + (shapes.length === 1 ? ' service area' : ' service areas') + ', approx. ' + totalKm + ' sq km total',
+      version: 1,
+      coordinateOrder: 'lat,lng',
+      shapeCount: shapes.length,
+      totalAreaSqKm: totalKm,
+      shapes: shapes
+    };
+  }
+
+  function waitForGeocodes() {
+    var ps = fg.getLayers().map(function (l) { return l._sa.pending ? l._sa.promise : null; }).filter(Boolean);
+    if (!ps.length) return Promise.resolve();
+    var timeout = new Promise(function (r) { setTimeout(r, 8000); });
+    return Promise.race([Promise.all(ps), timeout]);
+  }
+
+  /* ---------- restore saved value ---------- */
+  function restore(value) {
+    if (!value) return;
+    var obj = value;
+    if (typeof value === 'string') {
+      try { obj = JSON.parse(value); } catch (e) { return; }
+    }
+    if (!obj || !obj.shapes) return;
+    fg.clearLayers();
+    obj.shapes.forEach(function (s) {
+      if (!s.coordinates || s.coordinates.length < 3) return;
+      var poly = L.polygon(s.coordinates, shapeStyle());
+      fg.addLayer(poly);
+      initShape(poly, s.name, s.location);
+      refreshShape(poly, false);
+    });
+    if (fg.getLayers().length) map.fitBounds(fg.getBounds(), { padding: [30, 30] });
+    renderList();
+  }
+
+  function shapeStyle() { return { color: '#0e7c66', weight: 3, fillColor: '#0e7c66', fillOpacity: 0.22 }; }
+
+  /* ---------- map ---------- */
+  function initMap() {
+    if (map) return;
+    map = L.map('map', { worldCopyJump: true, tap: true }).setView([cfg.lat, cfg.lng], cfg.zoom);
+
+    var street = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+    var sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19, attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics'
+    });
+    L.control.layers({ 'Street map': street, 'Satellite': sat }, null, { position: 'topright' }).addTo(map);
+    L.control.scale({ imperial: false }).addTo(map);
+
+    fg = new L.FeatureGroup().addTo(map);
+    map.addControl(new L.Control.Draw({
+      position: 'topleft',
+      draw: {
+        polygon: { allowIntersection: false, showArea: false, shapeOptions: shapeStyle(),
+                   drawError: { color: '#b3261e', message: 'Shape edges cannot cross each other.' } },
+        rectangle: { showArea: false, shapeOptions: shapeStyle() },
+        polyline: false, circle: false, marker: false, circlemarker: false
+      },
+      edit: { featureGroup: fg, remove: true }
+    }));
+
+    map.on(L.Draw.Event.CREATED, function (e) {
+      fg.addLayer(e.layer);
+      initShape(e.layer);
+      nameShapes();
+      refreshShape(e.layer, true);
+      renderList();
+      setStatus('');
+    });
+    map.on(L.Draw.Event.EDITED, function (e) {
+      e.layers.eachLayer(function (l) { refreshShape(l, true); });
+      renderList();
+    });
+    map.on(L.Draw.Event.DELETED, function () { nameShapes(); renderList(); });
+
+    mapReady = true;
+    renderList();
+    if (pendingValue) { restore(pendingValue); pendingValue = null; }
+    setTimeout(function () { map.invalidateSize(); resize(); }, 200);
+  }
+
+  /* ---------- search / locate ---------- */
+  function doSearch() {
+    var q = $('search').value.trim();
+    if (!q) return;
+    setStatus('Searching\u2026');
+    fetch('https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&accept-language=en&q=' + encodeURIComponent(q))
+      .then(function (r) { return r.json(); })
+      .then(function (res) {
+        if (!res || !res.length) { setStatus('No place found. Try a different search.'); return; }
+        var b = res[0].boundingbox;
+        map.fitBounds([[+b[0], +b[2]], [+b[1], +b[3]]]);
+        setStatus('');
+      })
+      .catch(function () { setStatus('Search is unavailable right now. You can still pan and zoom the map.'); });
+  }
+  $('searchBtn').addEventListener('click', doSearch);
+  $('search').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
+  $('locBtn').addEventListener('click', function () {
+    if (!navigator.geolocation) { setStatus('Location is not available in this browser.'); return; }
+    setStatus('Finding your location\u2026');
+    navigator.geolocation.getCurrentPosition(function (pos) {
+      map.setView([pos.coords.latitude, pos.coords.longitude], 12);
+      setStatus('');
+    }, function () { setStatus('Could not get your location. Use the search box instead.'); }, { timeout: 8000 });
+  });
+
+  /* ---------- Jotform wiring ---------- */
+  function start() {
+    if (inJotform) {
+      cfg.lat = parseFloat(setting('defaultLat', cfg.lat));
+      cfg.lng = parseFloat(setting('defaultLng', cfg.lng));
+      cfg.zoom = parseInt(setting('defaultZoom', cfg.zoom), 10);
+      cfg.requireShape = String(setting('requireShape', 'yes')).toLowerCase() !== 'no';
+      var mh = parseInt(setting('mapHeight', 400), 10);
+      if (mh >= 250) $('map').style.height = mh + 'px';
+    }
+    initMap();
+  }
+
+  if (inJotform) {
+    JFCustomWidget.subscribe('ready', function () { start(); });
+    JFCustomWidget.subscribe('populate', function (data) {
+      var v = (data && data.value !== undefined) ? data.value : data;
+      if (mapReady) restore(v); else pendingValue = v;
+    });
+    JFCustomWidget.subscribe('submit', function () {
+      if (!fg.getLayers().length) {
+        if (cfg.requireShape) {
+          setStatus('Please draw at least one area on the map.');
+          JFCustomWidget.sendSubmit({ valid: false, message: 'Please draw at least one area on the map.' });
+        } else {
+          JFCustomWidget.sendSubmit({ valid: true, value: '' });
+        }
+        return;
+      }
+      setStatus('Saving your areas\u2026');
+      waitForGeocodes().then(function () {
+        var payload = buildPayload();
+        setStatus('');
+        JFCustomWidget.sendSubmit({ valid: true, value: JSON.stringify(payload) });
+      });
+    });
+  } else {
+    // Standalone testing outside Jotform
+    start();
+    window.__buildPayload = buildPayload;
+    console.log('Standalone mode: run __buildPayload() in the console to inspect the saved data.');
+  }
+})();
+</script>
+</body>
+</html>
