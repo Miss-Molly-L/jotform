@@ -7,6 +7,27 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/leaflet.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css">
 <script src="https://js.jotform.com/JotFormCustomWidget.min.js"></script>
+<script>
+// Listen for Jotform's messages straight away, before the map libraries load,
+// so nothing sent early is missed. The main script further down picks these up.
+window.__jf = { ready: false, populate: null, submit: false };
+(function () {
+  if (typeof window.JFCustomWidget === 'undefined') return;
+  try {
+    JFCustomWidget.subscribe('ready', function () {
+      window.__jf.ready = true;
+      if (window.__jfOnReady) window.__jfOnReady();
+    });
+    JFCustomWidget.subscribe('populate', function (data) {
+      window.__jf.populate = data;
+      if (window.__jfOnPopulate) window.__jfOnPopulate(data);
+    });
+    JFCustomWidget.subscribe('submit', function () {
+      if (window.__jfOnSubmit) window.__jfOnSubmit(); else window.__jf.submit = true;
+    });
+  } catch (e) {}
+})();
+</script>
 <style>
   :root {
     --ink: #1d2b2a;
@@ -90,6 +111,20 @@
     if (!inJotform) return;
     var h = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight) + 8;
     try { JFCustomWidget.requestFrameResize({ height: h }); } catch (e) {}
+  }
+
+  // Tell Jotform the current answer every time something changes,
+  // so the value is already saved by the time the form is submitted.
+  var pushTimer = null;
+  function pushValue() {
+    if (!inJotform || !fg) return;
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(function () {
+      try {
+        var value = fg.getLayers().length ? JSON.stringify(buildPayload()) : '';
+        JFCustomWidget.sendData({ value: value });
+      } catch (e) {}
+    }, 300);
   }
 
   // Show unexpected errors on screen so problems are visible, not silent
@@ -196,6 +231,7 @@
 
   /* ---------- UI list ---------- */
   function renderList() {
+    pushValue();
     var layers = fg.getLayers();
     var list = $('list');
     var total = 0;
@@ -230,7 +266,7 @@
         '<input class="name-input" type="text" maxlength="60" aria-label="Name for this area" value="' + esc(sa.name) + '">' +
         '<div class="actions"><button type="button" data-act="zoom">Show</button><button type="button" class="danger" data-act="del">Remove</button></div>' +
         '<div class="meta">' + metaHtml(sa) + '</div>';
-      el.querySelector('.name-input').addEventListener('input', function (e) { sa.name = e.target.value; });
+      el.querySelector('.name-input').addEventListener('input', function (e) { sa.name = e.target.value; pushValue(); });
       el.querySelector('[data-act=zoom]').addEventListener('click', function () { map.fitBounds(l.getBounds(), { padding: [30, 30] }); });
       el.querySelector('[data-act=del]').addEventListener('click', function () { fg.removeLayer(l); nameShapes(); renderList(); });
       list.appendChild(el);
@@ -403,42 +439,46 @@
   }
 
   /* ---------- Jotform wiring ---------- */
-  if (inJotform) {
-    JFCustomWidget.subscribe('ready', function () {
-      if (started) {
-        // The fallback below already built the map; just pick up the real settings.
-        applySettings();
-        if (map && fg && !fg.getLayers().length) map.setView([cfg.lat, cfg.lng], cfg.zoom);
-        resize();
+  function onReady() {
+    if (started) {
+      // The fallback below already built the map; just pick up the real settings.
+      applySettings();
+      if (map && fg && !fg.getLayers().length) map.setView([cfg.lat, cfg.lng], cfg.zoom);
+      resize();
+    } else {
+      start();
+    }
+  }
+  function onPopulate(data) {
+    var v = (data && data.value !== undefined) ? data.value : data;
+    if (mapReady) restore(v); else pendingValue = v;
+  }
+  function onSubmit() {
+    // Answer straight away: Jotform will not wait long for a reply.
+    if (!fg || !fg.getLayers().length) {
+      if (cfg.requireShape) {
+        setStatus('Please draw at least one area on the map.');
+        JFCustomWidget.sendSubmit({ valid: false, message: 'Please draw at least one area on the map.' });
       } else {
-        start();
+        JFCustomWidget.sendSubmit({ valid: true, value: '' });
       }
-    });
+      return;
+    }
+    setStatus('');
+    JFCustomWidget.sendSubmit({ valid: true, value: JSON.stringify(buildPayload()) });
+  }
+
+  if (inJotform) {
+    window.__jfOnReady = onReady;
+    window.__jfOnPopulate = onPopulate;
+    window.__jfOnSubmit = onSubmit;
+    // Catch up on anything that arrived before this script finished loading
+    if (window.__jf.ready) onReady();
+    if (window.__jf.populate) onPopulate(window.__jf.populate);
     // Fallback: if Jotform's "ready" signal never arrives, start anyway.
     setTimeout(start, 1500);
     window.addEventListener('load', function () { setTimeout(resize, 300); });
-
-    JFCustomWidget.subscribe('populate', function (data) {
-      var v = (data && data.value !== undefined) ? data.value : data;
-      if (mapReady) restore(v); else pendingValue = v;
-    });
-    JFCustomWidget.subscribe('submit', function () {
-      if (!fg || !fg.getLayers().length) {
-        if (cfg.requireShape) {
-          setStatus('Please draw at least one area on the map.');
-          JFCustomWidget.sendSubmit({ valid: false, message: 'Please draw at least one area on the map.' });
-        } else {
-          JFCustomWidget.sendSubmit({ valid: true, value: '' });
-        }
-        return;
-      }
-      setStatus('Saving your areas\u2026');
-      waitForGeocodes().then(function () {
-        var payload = buildPayload();
-        setStatus('');
-        JFCustomWidget.sendSubmit({ valid: true, value: JSON.stringify(payload) });
-      });
-    });
+    if (window.__jf.submit) { window.__jf.submit = false; onSubmit(); }
   } else {
     // Standalone testing outside Jotform: start straight away
     start();
