@@ -51,7 +51,7 @@
     <button class="btn secondary" id="locBtn" type="button">Use my location</button>
   </div>
   <div id="map" role="application" aria-label="Map for drawing service areas"></div>
-  <p class="hint">Use the shape tools at the top left of the map (polygon or rectangle) to outline each area you service. You can add as many shapes as you need, and zoom or drag the map anywhere. Use the pencil tool to adjust a shape or the bin to remove one.</p>
+  <p class="hint">Use the shape tools at the top left of the map to outline each area you service. You can add as many shapes as you need, be sure to name each area. Zoom or drag the map anywhere. Use the pencil tool to adjust a shape or the bin to remove one.</p>
   <div class="status" id="status" role="status" aria-live="polite"></div>
   <div class="summary" id="summary"></div>
   <div class="list" id="list"></div>
@@ -63,14 +63,11 @@
 (function () {
   'use strict';
 
-  var map, fg, mapReady = false, pendingValue = null, started = false;
+  var map, fg, mapReady = false, pendingValue = null;
   var cfg = { lat: -25.0, lng: 134.0, zoom: 4, requireShape: true, height: 700 };
   var shapeSeq = 0;
   var geoChain = Promise.resolve();
-
-  // Are we running inside an iframe (i.e. inside a Jotform form)?
-  var inFrame = (function () { try { return window.self !== window.top; } catch (e) { return true; } })();
-  var inJotform = typeof window.JFCustomWidget !== 'undefined' && inFrame;
+  var inJotform = typeof window.JFCustomWidget !== 'undefined';
 
   /* ---------- helpers ---------- */
   function setting(name, def) {
@@ -89,12 +86,6 @@
     var h = Math.max(document.documentElement.scrollHeight, document.body.scrollHeight) + 8;
     try { JFCustomWidget.requestFrameResize({ height: h }); } catch (e) {}
   }
-
-  // Show unexpected errors on screen so problems are visible, not silent
-  window.addEventListener('error', function (e) {
-    if (!e || !e.message || e.message === 'Script error.') return;
-    setStatus('Something went wrong: ' + e.message);
-  });
 
   // Spherical polygon area in square metres (Chamberlain-Duquette)
   function ringArea(pts) {
@@ -318,7 +309,7 @@
       draw: {
         polygon: { allowIntersection: false, showArea: false, shapeOptions: shapeStyle(),
                    drawError: { color: '#b3261e', message: 'Shape edges cannot cross each other.' } },
-        rectangle: { showArea: false, shapeOptions: shapeStyle() },
+        rectangle: false,
         polyline: false, circle: false, marker: false, circlemarker: false
       },
       edit: { featureGroup: fg, remove: true }
@@ -342,12 +333,10 @@
     renderList();
     if (pendingValue) { restore(pendingValue); pendingValue = null; }
     setTimeout(function () { map.invalidateSize(); resize(); }, 200);
-    setTimeout(function () { map.invalidateSize(); resize(); }, 1200);
   }
 
   /* ---------- search / locate ---------- */
   function doSearch() {
-    if (!map) { setStatus('The map is still loading. Please try again in a moment.'); return; }
     var q = $('search').value.trim();
     if (!q) return;
     setStatus('Searching\u2026');
@@ -364,7 +353,6 @@
   $('searchBtn').addEventListener('click', doSearch);
   $('search').addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); doSearch(); } });
   $('locBtn').addEventListener('click', function () {
-    if (!map) { setStatus('The map is still loading. Please try again in a moment.'); return; }
     if (!navigator.geolocation) { setStatus('Location is not available in this browser.'); return; }
     setStatus('Finding your location\u2026');
     navigator.geolocation.getCurrentPosition(function (pos) {
@@ -373,55 +361,27 @@
     }, function () { setStatus('Could not get your location. Use the search box instead.'); }, { timeout: 8000 });
   });
 
-  /* ---------- start-up ---------- */
-  function applySettings() {
-    if (!inJotform) return;
-    var lat = parseFloat(setting('defaultLat', cfg.lat));
-    var lng = parseFloat(setting('defaultLng', cfg.lng));
-    var zoom = parseInt(setting('defaultZoom', cfg.zoom), 10);
-    if (!isNaN(lat)) cfg.lat = lat;
-    if (!isNaN(lng)) cfg.lng = lng;
-    if (!isNaN(zoom)) cfg.zoom = zoom;
-    cfg.requireShape = String(setting('requireShape', 'yes')).toLowerCase() !== 'no';
-    var mh = parseInt(setting('mapHeight', 400), 10);
-    if (mh >= 250) $('map').style.height = mh + 'px';
-  }
-
-  // Safe to call more than once: the map is only built the first time.
-  function start() {
-    if (started) return;
-    started = true;
-    try {
-      applySettings();
-      initMap();
-    } catch (err) {
-      setStatus('The map could not start: ' + (err && err.message ? err.message : err));
-      if (window.console) console.error(err);
-    }
-  }
-
   /* ---------- Jotform wiring ---------- */
-  if (inJotform) {
-    JFCustomWidget.subscribe('ready', function () {
-      if (started) {
-        // The fallback below already built the map; just pick up the real settings.
-        applySettings();
-        if (map && fg && !fg.getLayers().length) map.setView([cfg.lat, cfg.lng], cfg.zoom);
-        resize();
-      } else {
-        start();
-      }
-    });
-    // Fallback: if Jotform's "ready" signal never arrives, start anyway.
-    setTimeout(start, 1500);
-    window.addEventListener('load', function () { setTimeout(resize, 300); });
+  function start() {
+    if (inJotform) {
+      cfg.lat = parseFloat(setting('defaultLat', cfg.lat));
+      cfg.lng = parseFloat(setting('defaultLng', cfg.lng));
+      cfg.zoom = parseInt(setting('defaultZoom', cfg.zoom), 10);
+      cfg.requireShape = String(setting('requireShape', 'yes')).toLowerCase() !== 'no';
+      var mh = parseInt(setting('mapHeight', 400), 10);
+      if (mh >= 250) $('map').style.height = mh + 'px';
+    }
+    initMap();
+  }
 
+  if (inJotform) {
+    JFCustomWidget.subscribe('ready', function () { start(); });
     JFCustomWidget.subscribe('populate', function (data) {
       var v = (data && data.value !== undefined) ? data.value : data;
       if (mapReady) restore(v); else pendingValue = v;
     });
     JFCustomWidget.subscribe('submit', function () {
-      if (!fg || !fg.getLayers().length) {
+      if (!fg.getLayers().length) {
         if (cfg.requireShape) {
           setStatus('Please draw at least one area on the map.');
           JFCustomWidget.sendSubmit({ valid: false, message: 'Please draw at least one area on the map.' });
@@ -438,10 +398,10 @@
       });
     });
   } else {
-    // Standalone testing outside Jotform: start straight away
+    // Standalone testing outside Jotform
     start();
     window.__buildPayload = buildPayload;
-    if (window.console) console.log('Standalone mode: run __buildPayload() in the console to inspect the saved data.');
+    console.log('Standalone mode: run __buildPayload() in the console to inspect the saved data.');
   }
 })();
 </script>
